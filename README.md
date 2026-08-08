@@ -8,8 +8,10 @@ Go-based MCP server for Windows system cleanup and developer-environment managem
 | Tool | Description |
 |------|-------------|
 | `cleaner_scan` | Dry-run scan: lists all dev cache locations with sizes. Filters: `categories`, `min_size_mb`, `older_than_days`. |
-| `cleaner_run` | Deletes caches across 10 categories (Python, Node, Rust, Go, JVM, ML/AI, IDEs, Docker, browsers, DB, games...). Same filters. |
-| `cleaner_purge` | Runs tool-managed purge commands (`pip cache purge`, `uv cache clean`, `npm cache clean --force`, `docker prune`, ...) with a per-command timeout so hung tools can't block the run. |
+| `cleaner_run` | Deletes caches across 10 categories (Python, Node, Rust, Go, JVM, ML/AI, IDEs, Docker, browsers, DB, games...). Same filters. Runs in the background — returns a `job_id`, poll with `cleaner_poll`. |
+| `cleaner_purge` | Runs tool-managed purge commands (`pip cache purge`, `uv cache clean`, `npm cache clean --force`, `docker prune`, ...) with a per-command timeout so hung tools can't block the run. Runs in the background — returns a `job_id`, poll with `cleaner_poll`. |
+| `cleaner_poll` | Poll a background job (any of the async tools below) by `job_id`. Returns status (`running`/`done`/`error`), incremental progress, and the final result. |
+| `cleaner_jobs` | List recent background jobs and their status (no progress or results). |
 
 ### System info (`internal/sysinfo`)
 | Tool | Description |
@@ -18,7 +20,7 @@ Go-based MCP server for Windows system cleanup and developer-environment managem
 | `dir_sizes` | On-disk size of arbitrary files/directories. |
 | `hibernate_status` | hiberfil.sys presence + size. |
 | `set_hibernate` | Toggle hibernation via powercfg (frees hiberfil.sys). Requires admin. |
-| `dism_cleanup` | `DISM /Online /Cleanup-Image /StartComponentCleanup` (WinSxS trim). Requires admin. |
+| `dism_cleanup` | `DISM /Online /Cleanup-Image /StartComponentCleanup` (WinSxS trim). Requires admin. Runs in the background — returns a `job_id`, poll with `cleaner_poll`. |
 | `check_admin` | Reports whether the server runs elevated. |
 
 ### Language manager (`internal/langmgr`)
@@ -32,7 +34,7 @@ Go-based MCP server for Windows system cleanup and developer-environment managem
 | Tool | Description |
 |------|-------------|
 | `recycle_info` | Total size + item count of the recycle bin on every drive. |
-| `recycle_empty` | Empty the recycle bin on every drive. `dry_run` previews contents first. |
+| `recycle_empty` | Empty the recycle bin on every drive. `dry_run` previews contents first. Runs in the background — returns a `job_id`, poll with `cleaner_poll`. |
 | `thumbnail_info` | Size of the Explorer thumbnail/icon cache (thumbcache_*.db / iconcache_*.db). |
 | `thumbnail_clear` | Delete the Explorer thumbnail/icon cache. Locked files are reported; caches rebuild on demand. |
 | `temp_info` | Size of the user and system temp folders. |
@@ -44,14 +46,18 @@ Go-based MCP server for Windows system cleanup and developer-environment managem
 | `startup_inventory` | Startup entries from Run/RunOnce registry keys (HKLM + HKCU) and the Startup folders. |
 | `pagefile_info` | Configured page files and their current sizes (system-managed `?:\pagefile.sys` resolves to the system drive). |
 | `wu_cache_info` | Size of the Windows Update download cache. |
-| `wu_cache_clear` | Clear the Windows Update download cache. Requires admin. |
-| `winsxs_superseded` | `DISM /Online /Cleanup-Image /StartComponentCleanup /ResetBase` — permanently removes superseded components. More aggressive than `dism_cleanup`. Requires admin. |
+| `wu_cache_clear` | Clear the Windows Update download cache. Requires admin. Runs in the background — returns a `job_id`, poll with `cleaner_poll`. |
+| `winsxs_superseded` | `DISM /Online /Cleanup-Image /StartComponentCleanup /ResetBase` — permanently removes superseded components. More aggressive than `dism_cleanup`. Requires admin. Runs in the background — returns a `job_id`, poll with `cleaner_poll`. |
 
 ### Diagnostics (`internal/server`)
 | Tool | Description |
 |------|-------------|
 | `system_report` | One-shot aggregate: OS version, memory, disk usage, admin state, hibernation, recycle bin, thumbnails, temp, page files, WU cache, startup inventory. |
-| `cleanup_all` | Runs every cleanup in sequence: dev caches, recycle bin, thumbnails, temp, WU cache, WinSxS. Admin sections skipped when not elevated. `dry_run` previews everything. |
+| `cleanup_all` | Runs every cleanup in sequence: dev caches, recycle bin, thumbnails, temp, WU cache, WinSxS. Admin sections skipped when not elevated. `dry_run` previews everything. Runs in the background — returns a `job_id`, poll with `cleaner_poll` for per-section progress. |
+
+### Background jobs
+
+Long-running tools (`cleaner_run`, `cleaner_purge`, `recycle_empty`, `wu_cache_clear`, `dism_cleanup`, `winsxs_superseded`, `cleanup_all`) exceed an MCP client's request timeout when run synchronously, so they return immediately with a `job_id` and finish in the background. Poll the result with `cleaner_poll` (`status`: `running` → `done`/`error`, plus `progress` while running and `result` when done) or list recent jobs with `cleaner_jobs`. `cleaner_run` and the `cleanup_all` dev-cache section report incremental `done`/`total` progress per target; the other tools report a `phase` while running.
 
 ## Building
 
@@ -135,6 +141,30 @@ This is only the beginning. The MCP server is the foundation; the next step is a
 - **For AI** — the GUI and its actions exposed the same way the MCP tools are, so agents can inspect, plan, and perform cleanup with the same visibility a human has.
 
 Every tool already returns structured JSON (`system_report`, `cleanup_all`, and the individual info/clear tools), so a GUI or agent front-end can be built on top of the server without changing it.
+
+### Backlog
+
+Gaps against the current tool set, roughly in priority order:
+
+**High value (fits the dev-env scope directly):**
+- **WSL2/Docker VHDX compaction** — `wsl --shutdown` + diskpart `compact vdisk` reclaims slack space non-destructively. Today the cleaner only deletes Docker's WSL data folder outright (category 6), which is destructive and loses images/containers.
+- **System-wide build-artifact scanner** — walk arbitrary root paths for `node_modules`, `target`, `dist`, `build`, `.venv`, `__pycache__`, etc. and report reclaimable size. The existing cache categories cover known tool caches, not project-local junk anywhere on disk.
+- **Startup entry disable/remove** — `startup_inventory` reads Run/RunOnce + Startup folder but has no write counterpart.
+- **Scheduled Tasks bloat** — many installers register via Task Scheduler instead of Run keys (updaters, telemetry); `startup_inventory` misses these entirely.
+
+**Medium value:**
+- **Windows.old / old feature-update leftovers** — can be 10-20GB post-upgrade, currently invisible to `system_report`.
+- **VSS shadow copy / System Restore size** — often multi-GB (`vssadmin list shadowstorage` + a trim tool).
+- **Orphaned Program Files/AppData** — folders left behind by uninstalled software with no matching registry entry.
+- **Empty folder sweep** — cheap, easy dry-run tool.
+
+**Lower priority:**
+- **Report export** — a JSON/CSV/HTML/PDF/Markdown export of a cleanup run (before/after, `freed_mb` per category). `RunReport` already tracks `freed_mb`, so this is mostly plumbing.
+- **Duplicate file finder** — hash-based; more a disk-analyzer feature than cleanup, but useful.
+
+## Scope
+
+What Pulse has that this doesn't: GPU metrics, network throughput, CPU topology, live process list/kill-adjacent detail, Windows event log search, multi-format report export. Not built for any of that — not a loss, just a different scope.
 
 ## Notes
 

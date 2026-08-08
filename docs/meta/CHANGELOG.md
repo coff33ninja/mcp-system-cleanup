@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Background job infrastructure for long-running tools. `cleaner_run`, `cleaner_purge`, `recycle_empty`, `wu_cache_clear`, `dism_cleanup`, `winsxs_superseded`, and `cleanup_all` now return a `job_id` immediately and run in the background; `cleaner_poll` retrieves status, incremental progress, and the final result, and `cleaner_jobs` lists recent jobs.
+- Per-target progress reporting in the cache cleaner (`cleaner.RunProgress`) with per-section progress for the `cleanup_all` dev-cache stage.
+
 ## [0.1.0] - 2026-08-07
 
 ### Added

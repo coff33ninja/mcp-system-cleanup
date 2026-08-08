@@ -23,7 +23,13 @@ func recycleInfoHandler(ctx context.Context, req *mcp.CallToolRequest, args Empt
 }
 
 func recycleEmptyHandler(ctx context.Context, req *mcp.CallToolRequest, args RecycleEmptyArgs) (*mcp.CallToolResult, any, error) {
-	return &mcp.CallToolResult{}, map[string]any{"result": recycle.Empty(ctx, args.DryRun, args.TimeoutSec)}, nil
+	dryRun := args.DryRun
+	timeoutSec := args.TimeoutSec
+	job := jobMgr.start("recycle_empty", func(setProgress func(any)) (any, error) {
+		setProgress(map[string]any{"phase": "emptying"})
+		return map[string]any{"result": recycle.Empty(context.Background(), dryRun, timeoutSec)}, nil
+	})
+	return &mcp.CallToolResult{}, map[string]any{"job_id": job.ID, "status": "started"}, nil
 }
 
 // ============================ Thumbnails & temp ============================
@@ -72,18 +78,29 @@ func wuCacheClearHandler(ctx context.Context, req *mcp.CallToolRequest, args WUC
 	if !isAdmin() {
 		return nil, nil, fmt.Errorf("wu_cache_clear: requires administrator privileges")
 	}
-	return &mcp.CallToolResult{}, map[string]any{"result": sysops.ClearWUCache(ctx, args.DryRun, args.TimeoutSec)}, nil
+	dryRun := args.DryRun
+	timeoutSec := args.TimeoutSec
+	job := jobMgr.start("wu_cache_clear", func(setProgress func(any)) (any, error) {
+		setProgress(map[string]any{"phase": "clearing"})
+		return map[string]any{"result": sysops.ClearWUCache(context.Background(), dryRun, timeoutSec)}, nil
+	})
+	return &mcp.CallToolResult{}, map[string]any{"job_id": job.ID, "status": "started"}, nil
 }
 
 func winsxsHandler(ctx context.Context, req *mcp.CallToolRequest, args DISMArgs) (*mcp.CallToolResult, any, error) {
 	if !isAdmin() {
 		return nil, nil, fmt.Errorf("winsxs_superseded: requires administrator privileges")
 	}
-	res := sysinfo.DISMResetBase(ctx, args.TimeoutSec)
-	if res.Error != "" {
-		return &mcp.CallToolResult{}, map[string]any{"ok": false, "error": res.Error, "elapsed_ms": res.ElapsedMs, "output": res.Output}, nil
-	}
-	return &mcp.CallToolResult{}, map[string]any{"ok": true, "elapsed_ms": res.ElapsedMs, "output": res.Output}, nil
+	timeoutSec := args.TimeoutSec
+	job := jobMgr.start("winsxs_superseded", func(setProgress func(any)) (any, error) {
+		setProgress(map[string]any{"phase": "ResetBase"})
+		res := sysinfo.DISMResetBase(context.Background(), timeoutSec)
+		if res.Error != "" {
+			return map[string]any{"ok": false, "error": res.Error, "elapsed_ms": res.ElapsedMs, "output": res.Output}, nil
+		}
+		return map[string]any{"ok": true, "elapsed_ms": res.ElapsedMs, "output": res.Output}, nil
+	})
+	return &mcp.CallToolResult{}, map[string]any{"job_id": job.ID, "status": "started"}, nil
 }
 
 // ============================ Diagnostics ============================
@@ -111,26 +128,53 @@ type CleanupAllArgs struct {
 	TimeoutSec int  `json:"timeout_sec,omitempty"`
 }
 
-// cleanupAllHandler runs every cleanup in sequence. Admin-only sections
-// (Windows Update cache, WinSxS) are skipped when not elevated.
+// cleanupAllHandler runs every cleanup in sequence as a background job so the
+// full run (which can include a multi-minute DISM reset) never blocks the MCP
+// request. Progress is reported per section via cleaner_poll. Admin-only
+// sections (Windows Update cache, WinSxS) are skipped when not elevated.
 func cleanupAllHandler(ctx context.Context, req *mcp.CallToolRequest, args CleanupAllArgs) (*mcp.CallToolResult, any, error) {
-	report := map[string]any{"dry_run": args.DryRun}
-	report["dev_caches"] = cleaner.Run(cleaner.Options{DryRun: args.DryRun})
-	report["recycle_bin"] = recycle.Empty(ctx, args.DryRun, args.TimeoutSec)
-	report["thumbnails"] = recycle.ClearThumbnails(args.DryRun)
-	report["temp"] = recycle.CleanTemp(args.DryRun)
-	if !isAdmin() {
-		report["wu_cache"] = map[string]any{"error": "requires administrator privileges"}
-		report["winsxs"] = map[string]any{"error": "requires administrator privileges"}
-		return &mcp.CallToolResult{}, report, nil
-	}
-	report["wu_cache"] = sysops.ClearWUCache(ctx, args.DryRun, args.TimeoutSec)
-	if args.DryRun {
-		report["winsxs"] = map[string]any{"dry_run": true}
-	} else {
-		report["winsxs"] = sysinfo.DISMResetBase(ctx, args.TimeoutSec)
-	}
-	return &mcp.CallToolResult{}, report, nil
+	dryRun := args.DryRun
+	timeoutSec := args.TimeoutSec
+	job := jobMgr.start("cleanup_all", func(setProgress func(any)) (any, error) {
+		report := map[string]any{"dry_run": dryRun}
+
+		var freed, skipped float64
+		report["dev_caches"] = cleaner.RunProgress(cleaner.Options{DryRun: dryRun}, func(r cleaner.Result, i, total int) {
+			if r.Status == "dry-run" || r.Status == "removed" {
+				freed += r.RemovedMB
+			} else if r.Status == "locked" {
+				skipped += r.Target.SizeMB
+			}
+			setProgress(map[string]any{"phase": "dev_caches", "done": i, "total": total, "freed_mb": freed, "skipped_mb": skipped})
+		})
+
+		setProgress(map[string]any{"phase": "recycle_bin"})
+		report["recycle_bin"] = recycle.Empty(context.Background(), dryRun, timeoutSec)
+
+		setProgress(map[string]any{"phase": "thumbnails"})
+		report["thumbnails"] = recycle.ClearThumbnails(dryRun)
+
+		setProgress(map[string]any{"phase": "temp"})
+		report["temp"] = recycle.CleanTemp(dryRun)
+
+		if !isAdmin() {
+			report["wu_cache"] = map[string]any{"error": "requires administrator privileges"}
+			report["winsxs"] = map[string]any{"error": "requires administrator privileges"}
+			return report, nil
+		}
+
+		setProgress(map[string]any{"phase": "wu_cache"})
+		report["wu_cache"] = sysops.ClearWUCache(context.Background(), dryRun, timeoutSec)
+
+		if dryRun {
+			report["winsxs"] = map[string]any{"dry_run": true}
+		} else {
+			setProgress(map[string]any{"phase": "winsxs"})
+			report["winsxs"] = sysinfo.DISMResetBase(context.Background(), timeoutSec)
+		}
+		return report, nil
+	})
+	return &mcp.CallToolResult{}, map[string]any{"job_id": job.ID, "status": "started"}, nil
 }
 
 // ============================ Registrations ============================
@@ -145,7 +189,7 @@ func registerOpsTools(server *mcp.Server) {
 
 	addToolClean(server, &mcp.Tool{
 		Name:        "recycle_empty",
-		Description: "Empty the recycle bin on every drive. Pass dry_run=true to preview the current contents first. Optional timeout_sec (default 120).",
+		Description: "Empty the recycle bin on every drive. Runs in the background and returns a job_id immediately; poll with cleaner_poll for the final result. Pass dry_run=true to preview the current contents first. Optional timeout_sec (default 120).",
 	}, safeHandler("recycle_empty", recycleEmptyHandler))
 
 	addToolClean(server, &mcp.Tool{
@@ -185,12 +229,12 @@ func registerOpsTools(server *mcp.Server) {
 
 	addToolClean(server, &mcp.Tool{
 		Name:        "wu_cache_clear",
-		Description: "Remove the contents of the Windows Update download cache. Requires admin; files locked by the Update service are reported.",
+		Description: "Remove the contents of the Windows Update download cache. Runs in the background and returns a job_id immediately; poll with cleaner_poll for the final result. Requires admin; files locked by the Update service are reported.",
 	}, safeHandler("wu_cache_clear", wuCacheClearHandler))
 
 	addToolClean(server, &mcp.Tool{
 		Name:        "winsxs_superseded",
-		Description: "Run DISM /Online /Cleanup-Image /StartComponentCleanup /ResetBase to permanently remove superseded Windows components from WinSxS. More aggressive than dism_cleanup. Requires admin. Optional timeout_sec (default 900).",
+		Description: "Run DISM /Online /Cleanup-Image /StartComponentCleanup /ResetBase to permanently remove superseded Windows components from WinSxS. More aggressive than dism_cleanup. Runs in the background and returns a job_id immediately; poll with cleaner_poll for the final result. Requires admin. Optional timeout_sec (default 900).",
 	}, safeHandler("winsxs_superseded", winsxsHandler))
 
 	addToolClean(server, &mcp.Tool{
@@ -200,6 +244,6 @@ func registerOpsTools(server *mcp.Server) {
 
 	addToolClean(server, &mcp.Tool{
 		Name:        "cleanup_all",
-		Description: "Run every cleanup in sequence: dev caches, recycle bin, thumbnails, temp folders, Windows Update cache, and WinSxS superseded components. Admin sections are skipped when not elevated. Pass dry_run=true to preview everything.",
+		Description: "Run every cleanup in sequence: dev caches, recycle bin, thumbnails, temp folders, Windows Update cache, and WinSxS superseded components. Runs in the background and returns a job_id immediately; poll with cleaner_poll for incremental progress and the final report. Admin sections are skipped when not elevated. Pass dry_run=true to preview everything.",
 	}, safeHandler("cleanup_all", cleanupAllHandler))
 }

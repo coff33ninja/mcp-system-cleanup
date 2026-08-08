@@ -138,14 +138,44 @@ func cleanerRunHandler(ctx context.Context, req *mcp.CallToolRequest, args Clean
 		MinSizeMB:     args.MinSizeMB,
 		OlderThanDays: args.OlderThanDays,
 	}
-	report := cleaner.Run(opts)
-	return &mcp.CallToolResult{}, map[string]any{
-		"freed_mb":   report.FreedMB,
-		"skipped_mb": report.SkippedMB,
-		"total_mb":   report.TotalMB,
-		"summary":    report.Summary(),
-		"results":    report.Results,
-	}, nil
+	job := jobMgr.start("cleaner_run", func(setProgress func(any)) (any, error) {
+		var freed, skipped float64
+		report := cleaner.RunProgress(opts, func(r cleaner.Result, i, total int) {
+			if r.Status == "dry-run" || r.Status == "removed" {
+				freed += r.RemovedMB
+			} else if r.Status == "locked" {
+				skipped += r.Target.SizeMB
+			}
+			setProgress(map[string]any{"done": i, "total": total, "freed_mb": freed, "skipped_mb": skipped})
+		})
+		return map[string]any{
+			"freed_mb":   report.FreedMB,
+			"skipped_mb": report.SkippedMB,
+			"total_mb":   report.TotalMB,
+			"summary":    report.Summary(),
+			"results":    report.Results,
+		}, nil
+	})
+	return &mcp.CallToolResult{}, map[string]any{"job_id": job.ID, "status": "started"}, nil
+}
+
+type CleanerPollArgs struct {
+	JobID string `json:"job_id"`
+}
+
+func cleanerPollHandler(ctx context.Context, req *mcp.CallToolRequest, args CleanerPollArgs) (*mcp.CallToolResult, any, error) {
+	if args.JobID == "" {
+		return nil, nil, fmt.Errorf("cleaner_poll: job_id is required")
+	}
+	snap, ok := jobMgr.snapshot(args.JobID)
+	if !ok {
+		return nil, nil, fmt.Errorf("cleaner_poll: unknown job_id %q", args.JobID)
+	}
+	return &mcp.CallToolResult{}, snap, nil
+}
+
+func cleanerJobsHandler(ctx context.Context, req *mcp.CallToolRequest, args EmptyArgs) (*mcp.CallToolResult, any, error) {
+	return &mcp.CallToolResult{}, map[string]any{"jobs": jobMgr.list()}, nil
 }
 
 type CleanerPurgeArgs struct {
@@ -155,8 +185,11 @@ type CleanerPurgeArgs struct {
 
 func cleanerPurgeHandler(ctx context.Context, req *mcp.CallToolRequest, args CleanerPurgeArgs) (*mcp.CallToolResult, any, error) {
 	opts := cleaner.Options{DryRun: args.DryRun, PurgeTimeoutSec: args.PurgeTimeoutSec}
-	results := cleaner.Purge(ctx, opts)
-	return &mcp.CallToolResult{}, map[string]any{"results": results}, nil
+	job := jobMgr.start("cleaner_purge", func(setProgress func(any)) (any, error) {
+		setProgress(map[string]any{"phase": "purging"})
+		return map[string]any{"results": cleaner.Purge(context.Background(), opts)}, nil
+	})
+	return &mcp.CallToolResult{}, map[string]any{"job_id": job.ID, "status": "started"}, nil
 }
 
 // ============================ System info tools ============================
@@ -202,11 +235,16 @@ func dismHandler(ctx context.Context, req *mcp.CallToolRequest, args DISMArgs) (
 	if !isAdmin() {
 		return nil, nil, fmt.Errorf("dism_cleanup: requires administrator privileges")
 	}
-	res := sysinfo.DISMCleanup(ctx, args.TimeoutSec)
-	if res.Error != "" {
-		return &mcp.CallToolResult{}, map[string]any{"ok": false, "error": res.Error, "elapsed_ms": res.ElapsedMs, "output": res.Output}, nil
-	}
-	return &mcp.CallToolResult{}, map[string]any{"ok": true, "elapsed_ms": res.ElapsedMs, "output": res.Output}, nil
+	timeoutSec := args.TimeoutSec
+	job := jobMgr.start("dism_cleanup", func(setProgress func(any)) (any, error) {
+		setProgress(map[string]any{"phase": "StartComponentCleanup"})
+		res := sysinfo.DISMCleanup(context.Background(), timeoutSec)
+		if res.Error != "" {
+			return map[string]any{"ok": false, "error": res.Error, "elapsed_ms": res.ElapsedMs, "output": res.Output}, nil
+		}
+		return map[string]any{"ok": true, "elapsed_ms": res.ElapsedMs, "output": res.Output}, nil
+	})
+	return &mcp.CallToolResult{}, map[string]any{"job_id": job.ID, "status": "started"}, nil
 }
 
 func adminHandler(ctx context.Context, req *mcp.CallToolRequest, args EmptyArgs) (*mcp.CallToolResult, any, error) {
@@ -278,12 +316,22 @@ func New(version string) *mcp.Server {
 
 	addToolClean(server, &mcp.Tool{
 		Name:        "cleaner_run",
-		Description: "Delete development caches across 10 categories (pip, npm, uv, cargo, Go, Rust, HuggingFace, JetBrains, VS Code, Docker, browsers, etc.). Use dry_run=true to preview. Filters: categories, min_size_mb, older_than_days.",
+		Description: "Delete development caches across 10 categories (pip, npm, uv, cargo, Go, Rust, HuggingFace, JetBrains, VS Code, Docker, browsers, etc.). Runs in the background and returns a job_id immediately; poll with cleaner_poll for progress and the final report. Filters: categories, min_size_mb, older_than_days.",
 	}, safeHandler("cleaner_run", cleanerRunHandler))
 
 	addToolClean(server, &mcp.Tool{
+		Name:        "cleaner_poll",
+		Description: "Poll a background cleanup job started by cleaner_run, cleaner_purge, recycle_empty, cleanup_all, wu_cache_clear, dism_cleanup, or winsxs_superseded. job_id is required. Returns status (running/done/error), incremental progress, and the final result when done.",
+	}, safeHandler("cleaner_poll", cleanerPollHandler))
+
+	addToolClean(server, &mcp.Tool{
+		Name:        "cleaner_jobs",
+		Description: "List recent background jobs and their status (no progress or results).",
+	}, safeHandler("cleaner_jobs", cleanerJobsHandler))
+
+	addToolClean(server, &mcp.Tool{
 		Name:        "cleaner_purge",
-		Description: "Run tool-managed cache purge commands (pip cache purge, uv cache clean, npm cache clean --force, docker prune, etc.) with a per-command timeout so hung tools cannot block the run. dry_run=true previews which tools are available.",
+		Description: "Run tool-managed cache purge commands (pip cache purge, uv cache clean, npm cache clean --force, docker prune, etc.) with a per-command timeout so hung tools cannot block the run. Runs in the background and returns a job_id immediately; poll with cleaner_poll for the final results. dry_run=true previews which tools are available.",
 	}, safeHandler("cleaner_purge", cleanerPurgeHandler))
 
 	addToolClean(server, &mcp.Tool{
@@ -308,7 +356,7 @@ func New(version string) *mcp.Server {
 
 	addToolClean(server, &mcp.Tool{
 		Name:        "dism_cleanup",
-		Description: "Run DISM /Online /Cleanup-Image /StartComponentCleanup to trim the Windows component store (WinSxS). Requires admin and can take several minutes. Optional timeout_sec (default 900).",
+		Description: "Run DISM /Online /Cleanup-Image /StartComponentCleanup to trim the Windows component store (WinSxS). Runs in the background and returns a job_id immediately; poll with cleaner_poll for progress and the final result. Requires admin and can take several minutes. Optional timeout_sec (default 900).",
 	}, safeHandler("dism_cleanup", dismHandler))
 
 	addToolClean(server, &mcp.Tool{

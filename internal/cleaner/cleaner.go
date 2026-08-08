@@ -412,10 +412,21 @@ func remove(path string) error {
 	return os.RemoveAll(path)
 }
 
+// ProgressFunc is invoked after each target is processed during a run, with
+// the per-target result and the overall position (index, total).
+type ProgressFunc func(r Result, index, total int)
+
 // Run performs a cleanup. If opts.DryRun, nothing is deleted.
 func Run(opts Options) RunReport {
+	return RunProgress(opts, nil)
+}
+
+// RunProgress performs a cleanup, calling onProgress after each target so
+// callers can stream incremental progress into an async job.
+func RunProgress(opts Options, onProgress ProgressFunc) RunReport {
 	var report RunReport
-	for _, tg := range Scan(opts) {
+	targets := Scan(opts)
+	for i, tg := range targets {
 		start := time.Now()
 		r := Result{Target: tg}
 		mb := tg.SizeMB
@@ -438,6 +449,9 @@ func Run(opts Options) RunReport {
 		}
 		r.ElapsedMs = time.Since(start).Milliseconds()
 		report.Results = append(report.Results, r)
+		if onProgress != nil {
+			onProgress(r, i+1, len(targets))
+		}
 	}
 	report.TotalMB = report.FreedMB + report.SkippedMB
 	return report
